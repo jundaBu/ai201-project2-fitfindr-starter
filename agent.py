@@ -18,7 +18,65 @@ Usage (once implemented):
     print(result["error"])   # None on success
 """
 
+import re
+
 from tools import search_listings, suggest_outfit, create_fit_card
+
+
+# ── query parsing ─────────────────────────────────────────────────────────────
+
+# Letter sizes (longest first so "XXL" matches before "XL"/"L").
+_LETTER_SIZES = ["xxs", "xxl", "xs", "xl", "s", "m", "l"]
+
+
+def _parse_query(query: str) -> dict:
+    """
+    Extract {description, size, max_price} from a natural-language query.
+
+    Uses regex/string matching (no LLM):
+      - max_price: a number after "under"/"below"/"<"/"$" → float, else None.
+      - size: "size 8", "W30", or a standalone letter size token → str, else None.
+      - description: the query with the matched price/size phrases stripped out.
+    """
+    text = query.strip()
+    lowered = text.lower()
+
+    # --- price: "under $30", "below 30", "$30", "< 40" ---
+    max_price = None
+    price_match = re.search(
+        r"(?:under|below|less than|<|\$)\s*\$?\s*(\d+(?:\.\d+)?)", lowered
+    )
+    if price_match:
+        max_price = float(price_match.group(1))
+
+    # --- size: explicit "size X", waist "W30", or a standalone letter size ---
+    size = None
+    size_match = re.search(r"\bsize\s+([a-z0-9/]+)\b", lowered)
+    if size_match:
+        size = size_match.group(1).upper()
+    else:
+        waist_match = re.search(r"\b(w\d{2}(?:\s*l\d{2})?)\b", lowered)
+        if waist_match:
+            size = waist_match.group(1).upper()
+        else:
+            for token in re.findall(r"\b[a-z]+\b", lowered):
+                if token in _LETTER_SIZES:
+                    size = token.upper()
+                    break
+
+    # --- description: blank out the spans we already consumed (matched on the
+    # lowered text, but spans map 1:1 onto the original since case-folding keeps
+    # length), then collapse leftover punctuation/whitespace. ---
+    chars = list(text)
+    for m in (price_match, size_match):
+        if m:
+            for i in range(*m.span()):
+                chars[i] = " "
+    description = "".join(chars)
+    description = re.sub(r"[,\.]", " ", description)
+    description = re.sub(r"\s+", " ", description).strip()
+
+    return {"description": description, "size": size, "max_price": max_price}
 
 
 # ── session state ─────────────────────────────────────────────────────────────
@@ -92,9 +150,62 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     Before writing code, complete the Planning Loop and State Management sections
     of planning.md — your implementation should match what you described there.
     """
-    # TODO: implement the planning loop
+    # Step 1: Initialize the session.
     session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
+
+    # Step 2: Parse the query into description / size / max_price.
+    session["parsed"] = _parse_query(query)
+    parsed = session["parsed"]
+
+    # Step 3: Search.
+    session["search_results"] = search_listings(
+        parsed["description"],
+        size=parsed["size"],
+        max_price=parsed["max_price"],
+    )
+
+    # Branch A — no matches: set an error and return early. Do NOT call the
+    # downstream tools with empty input.
+    if not session["search_results"]:
+        bits = [f"'{parsed['description']}'"]
+        if parsed["size"]:
+            bits.append(f"size {parsed['size']}")
+        if parsed["max_price"] is not None:
+            bits.append(f"under ${parsed['max_price']:g}")
+        session["error"] = (
+            f"I couldn't find any listings matching {', '.join(bits)}. "
+            "Try raising your budget, removing the size filter, or using broader keywords."
+        )
+        return session
+
+    # Step 4: Select the top-ranked result.
+    session["selected_item"] = session["search_results"][0]
+
+    # Step 5: Suggest an outfit from the selected item + wardrobe.
+    try:
+        session["outfit_suggestion"] = suggest_outfit(
+            session["selected_item"], session["wardrobe"]
+        )
+    except Exception as exc:  # LLM/network failure — fail gracefully, no fit card.
+        session["error"] = f"Couldn't generate an outfit idea right now ({exc}). Please try again."
+        return session
+
+    if not session["outfit_suggestion"] or not session["outfit_suggestion"].strip():
+        session["error"] = "Couldn't generate an outfit idea right now. Please try again."
+        return session
+
+    # Step 6: Create the fit card from the outfit + selected item.
+    try:
+        session["fit_card"] = create_fit_card(
+            session["outfit_suggestion"], session["selected_item"]
+        )
+    except Exception as exc:
+        # Soft failure: keep the listing + outfit, just note the card couldn't be made.
+        session["fit_card"] = (
+            f"(Couldn't generate a caption this time — {exc}. Your outfit idea is above.)"
+        )
+
+    # Step 7: Return the completed session.
     return session
 
 
